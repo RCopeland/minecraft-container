@@ -1,0 +1,52 @@
+services:
+  # --- The Bodyguard (Tailscale) ---
+  # Joins the tailnet as "minecraft". No tailscale serve config is provided
+  # because this stack is pure UDP — Bedrock speaks RakNet over UDP 19132,
+  # which Tailscale carries natively inside the tailnet. HTTPS certificates
+  # and funnel are irrelevant here, so TS_SERVE_CONFIG and TS_CERT_DOMAIN are
+  # intentionally omitted.
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: minecraft-tailscale
+    hostname: minecraft
+    environment:
+      - TS_AUTHKEY=${TAILSCALE_AUTH_KEY}
+      - TS_STATE_DIR=/var/lib/tailscale
+    volumes:
+      - tailscale_data:/var/lib/tailscale
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    restart: unless-stopped
+
+  # --- The App (Bedrock) ---
+  # Shares the tailscale container's network namespace, so it is ONLY reachable
+  # over the tailnet (via the 100.x.y.z tailnet IP or the MagicDNS hostname).
+  # No host ports are published, so nothing is exposed on the LAN or internet.
+  bedrock:
+    image: itzg/minecraft-bedrock-server:latest
+    container_name: minecraft-bedrock
+    network_mode: service:tailscale
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    # Override the image entrypoint so we can apply the iOS MTU fix before
+    # starting the server.
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    environment:
+      - EULA=${EULA}
+      - SERVER_NAME=${SERVER_NAME}
+      - GAMEMODE=${GAMEMODE}
+      - DIFFICULTY=${DIFFICULTY}
+      - ALLOW_CHEATS=${ALLOW_CHEATS}
+      - ONLINE_MODE=${ONLINE_MODE}
+      - TZ=${TZ:-America/New_York}
+    volumes:
+      - minecraft_data:/data
+      - ./entrypoint.sh:/entrypoint.sh:ro
+    depends_on:
+      - tailscale
+
+volumes:
+  tailscale_data:
+  minecraft_data:
