@@ -1,53 +1,92 @@
 services:
-  # --- The App (Bedrock) ---
+  # --- The App (Paper + Geyser) ---
   #
-  # Runs on the HOST network, not behind the tailscale sidecar. This is
-  # deliberate and load-bearing:
+  # A Java Edition server that Bedrock clients can also join, so the iPads and
+  # the Java PC share one world.
   #
-  #   * Bedrock speaks RakNet over UDP 19132. Tailscale's `serve` is TCP/HTTP
-  #     only, so there is no proxy path for it.
-  #   * This homelab has no /dev/net/tun, so every container runs
+  #   Paper       the Java server itself
+  #   Geyser      translates Bedrock <-> Java so iPads can connect
+  #   Floodgate   lets Bedrock players join WITHOUT owning Java accounts
+  #   ViaVersion  lets a newer Java client (26.3) join this 26.2 server
+  #   ViaBackwards the reverse direction, needed alongside ViaVersion
+  #
+  # NETWORKING: runs on the HOST network, not behind a tailscale sidecar.
+  #
+  #   * This homelab has no /dev/net/tun, so every container would run
   #     tun=userspace-networking. That mode forwards inbound tailnet traffic to
-  #     localhost *within the sidecar's own process tree*. A UDP socket owned by
-  #     a different container is not reachable that way -- verified by test:
-  #     the sidecar could receive tailnet UDP on any port, the app container
-  #     never could.
+  #     localhost *within the sidecar's own process tree*, so a socket owned by
+  #     a different container is unreachable. Verified: the sidecar could
+  #     receive tailnet UDP on any port; the app container never could, while
+  #     the same port answered fine on 127.0.0.1.
+  #   * Tailscale `serve` is HTTP/TCP only, so it cannot carry Minecraft's
+  #     traffic either.
   #
-  # On the host network the server binds the host's regular interfaces, so any
-  # device on the home LAN reaches it directly at <host-lan-ip>:19132. That is
-  # the intended access path: the kids' iPads are on the home wifi and do not
-  # need Tailscale at all.
+  # On the host network the server binds the host's normal interfaces, so
+  # devices on the home wifi reach it directly. Intended access is the LAN, so
+  # no Tailscale is needed on the kids' iPads.
   #
-  # If remote access is ever wanted, the correct fix is a real TUN device
-  # (/dev/net/tun) on the host so Tailscale leaves userspace mode -- not a
-  # published port and not a funnel.
-  bedrock:
-    image: itzg/minecraft-bedrock-server:latest
-    container_name: minecraft-bedrock
+  # If remote access is ever wanted, the correct fix is a real TUN device on
+  # the host so Tailscale leaves userspace mode -- not a published port and not
+  # a funnel.
+  minecraft:
+    image: itzg/minecraft-server:latest
+    container_name: minecraft-java
     network_mode: host
     restart: unless-stopped
-    # Keep graceful-shutdown defaults (see entrypoint.sh).
-    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    # Java 26.3 needs Java 25+. The image selects a suitable runtime for the
+    # server version, but pinning it avoids surprises on image updates.
     environment:
       - EULA=${EULA}
+      # TYPE=CUSTOM with a direct jar URL, NOT TYPE=PAPER.
+      # The itzg image's Paper installer still calls api.papermc.io, which
+      # PaperMC sunset and now returns HTTP 410. The downloader fails with a
+      # bare "Failed to download paper" and the container crash-loops.
+      # CUSTOM_SERVER accepts a URL and downloads it once into /data.
+      # This pins the current STABLE 26.2 build (Paper 26.3 is still BETA and
+      # Geyser cannot bridge to it). Switch back to TYPE=PAPER once the image
+      # tracks the new fill.papermc.io API.
+      # To upgrade later: stop, delete the jar from /data, start again.
+      - TYPE=CUSTOM
+      - CUSTOM_SERVER=${PAPER_DOWNLOAD_URL:-https://fill-data.papermc.io/v1/objects/5ab560a769c1ab413cb7f637dd0dc697974571f2db0a667cfbac511422e51b26/paper-26.2-132.jar}
+      # TYPE=CUSTOM leaves the image with no game version, so Modrinth plugin
+      # lookups fail with "...for loader paper and Minecraft version LATEST".
+      # Declare it explicitly; it must match the Paper jar pinned above.
+      - VERSION=26.2
+      # ViaVersion + ViaBackwards come from Modrinth (they publish a paper
+      # loader). Geyser and Floodgate do NOT: the Modrinth 'floodgate' project
+      # is Floodgate-Modded (fabric/neoforge only), and its Paper build is
+      # served by GeyserMC. So those two are fetched via PLUGINS below.
+      - MODRINTH_PROJECTS=viaversion,viabackwards
+      # Required when TYPE=CUSTOM is combined with MODRINTH_PROJECTS, otherwise
+      # startup aborts with "MODRINTH_LOADER must be set". These are Paper
+      # plugins, so the loader is paper.
+      - MODRINTH_LOADER=paper
+      # Geyser (Bedrock <-> Java bridge) and Floodgate (lets Bedrock players
+      # join without Java accounts). Both are the 'spigot' platform builds,
+      # which is what Paper uses. GeyserMC's endpoint always resolves 'latest'.
+      - PLUGINS=${GEYSER_PLUGINS:-https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/spigot,https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/spigot}
       - SERVER_NAME=${SERVER_NAME}
+      - MOTD=${MOTD}
       - GAMEMODE=${GAMEMODE}
       - DIFFICULTY=${DIFFICULTY}
-      - ALLOW_CHEATS=${ALLOW_CHEATS}
       - ONLINE_MODE=${ONLINE_MODE}
-      # MUST stay raknet. Bedrock 1.26.50+ defaults to transport=nethernet,
-      # which is a known Mojang regression (BDS-23108): the server logs
-      # "Accepting clients on 19132" but never opens the UDP socket, and every
-      # client times out. Set explicitly so a fresh /data volume cannot
-      # reintroduce the broken default.
-      - TRANSPORT=${TRANSPORT:-raknet}
-      # The Bedrock image defaults allow-list=true with an empty list, which
-      # locks everyone out. Access control comes from ONLINE_MODE instead.
-      - ALLOW_LIST=${ALLOW_LIST:-false}
+      - ENABLE_COMMAND_BLOCK=${ALLOW_CHEATS}
+      - VIEW_DISTANCE=${VIEW_DISTANCE:-10}
+      - MAX_PLAYERS=${MAX_PLAYERS:-10}
+      # Memory: the homelab has ~14GB total, ~6.7GB free.
+      - MEMORY=${MEMORY:-3G}
       - TZ=${TZ:-America/New_York}
+      # --- Geyser (Bedrock clients) ---
+      # Bedrock clients connect on UDP 19132; Java clients on TCP 25565.
+      - GEYSER_PORT=${GEYSER_PORT:-19132}
     volumes:
-      - minecraft_data:/data
-      - ./entrypoint.sh:/entrypoint.sh:ro
+      # Named explicitly so it can never collide with the earlier Bedrock
+      # stack's volume (minecraft-container_minecraft_data), which held a
+      # Bedrock-format world that this Java server cannot read anyway.
+      - minecraft_java_data:/data
+    # Paper saves the world on SIGTERM; give it room to finish cleanly.
+    stop_grace_period: 60s
 
 volumes:
-  minecraft_data:
+  minecraft_java_data:
+    name: minecraft-container_java_data

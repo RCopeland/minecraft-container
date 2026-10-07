@@ -1,187 +1,202 @@
-# Minecraft Bedrock on the homelab
+# Minecraft on the homelab
 
-A self-hosted [Minecraft Bedrock Dedicated Server](https://www.minecraft.net/en-us/download/server/bedrock)
-for **iPads and Windows PCs on the home LAN**, running on port `19132`.
+A **Java Edition server with Bedrock crossplay**, so the iPads and a Java PC share
+one world. Reachable from the home LAN.
 
-> **Tailnet-only was investigated and rejected.** See
-> [Why this runs on the host network](#why-this-runs-on-the-host-network) — the
-> short version is that Tailscale cannot carry a Bedrock server in this homelab's
-> current configuration, and the intended clients (the kids' iPads) are at home
-> anyway.
+```
+Java clients    ->  192.168.4.37:25565     (you: Java 26.3)
+Bedrock clients ->  192.168.4.37:19132     (the kids' iPads, Windows Bedrock)
+```
 
-## Why Bedrock
+| Component | Role |
+|-----------|------|
+| **Paper** 26.2 | The Java server itself |
+| **Geyser** | Translates Bedrock ↔ Java so iPads can join |
+| **Floodgate** | Lets Bedrock players join **without** owning Java accounts |
+| **ViaVersion** + **ViaBackwards** | Lets a newer Java client (26.3) join this 26.2 server |
 
-Bedrock Edition is the edition that runs on **iPads and Windows PC**, and those
-two cross-play on the same server. Java Edition cannot be joined by an iPad.
+## Why Java + Geyser rather than a Bedrock server
+
+Java and Bedrock are separate games with incompatible protocols, and **a Java
+client can never connect to a Bedrock server**. Geyser only bridges one
+direction — Bedrock clients joining a Java server — so the Java server is the
+hub and the iPads come in through Geyser.
+
+The earlier Bedrock-only setup worked for the iPads but shut out Java entirely,
+which is why this was rebuilt.
+
+## Why 26.2 and not 26.3
+
+The Java client is 26.3, but the server runs **26.2**, deliberately:
+
+- **Geyser emulates a Java 26.2 client.** On a 26.3 server it needs ViaVersion
+  *and* ViaBackwards bolted on, which the Geyser project documents as the
+  fragile path.
+- **Paper 26.3 is still BETA** (build 159); 26.2 build 132 is the current
+  **STABLE** release.
+
+ViaVersion makes the 26.3 client work against the 26.2 server, which is the
+supported way to do this. Revisit once Geyser and Paper ship stable 26.3.
 
 ## Why this runs on the host network
 
-This stack deliberately does **not** use the tailscale-sidecar pattern that
-`kavita-container`, `romm`, `n8n-container` and the others use. Two independent
-problems make that pattern unusable here:
+Deliberately **not** the tailscale-sidecar pattern used by `kavita-container`,
+`romm`, `n8n-container` and the rest. That pattern cannot carry Minecraft traffic
+on this homelab, for two independent reasons:
 
-**1. Tailscale cannot proxy UDP.** Every other stack in this homelab is an HTTP
-app, reached through `tailscale serve`, which is an HTTP/TCP reverse proxy. It
-has no UDP support (and `funnel` is TLS/SNI-based, so UDP is out there too).
-Bedrock is pure RakNet over UDP 19132, so there is no proxy path for it.
+**1. This homelab has no `/dev/net/tun`.** Without it Tailscale runs in
+`tun=userspace-networking` mode, which forwards inbound tailnet traffic to
+`localhost` *within its own process tree*, so a socket owned by a different
+container is unreachable. Verified directly — the sidecar could receive tailnet
+UDP on any port, the app container never could, while the same port answered
+fine on `127.0.0.1`.
 
-**2. This homelab has no `/dev/net/tun`.** Without that device node Tailscale
-runs in `tun=userspace-networking` mode, where it forwards inbound tailnet
-traffic to `localhost` *within its own process tree*. A UDP socket owned by a
-different container is not reachable that way. Verified directly:
+**2. `tailscale serve` is HTTP/TCP only.** It cannot carry Minecraft's traffic,
+and `funnel` is TLS/SNI-based so it is not an option either.
 
-```text
-sidecar listening on 19132, reached over tailnet   -> received
-app container listening on 19132, over tailnet     -> 0 bytes
-app container on 127.0.0.1:19132                   -> 148-byte RakNet pong
-```
+On the host network the server binds the host's normal interfaces, so LAN devices
+reach it directly. Intended access is the home wifi, so **the kids' iPads need no
+Tailscale at all**.
 
-So the server runs on the **host network** instead. It binds the host's normal
-interfaces and any device on the home wifi reaches it directly. If remote access
-is ever wanted, the correct fix is a real TUN device on the host so Tailscale
-leaves userspace mode — **not** a published port and **not** a funnel.
-
-## How it works
-
-- `bedrock` runs with `network_mode: host`, so it binds the host's interfaces
-  directly on UDP `19132`.
-- `entrypoint.sh` preserves the image's graceful-shutdown entrypoint, so
-  `docker compose stop` saves the world cleanly rather than killing it.
-- `TRANSPORT=raknet` is forced. See [Troubleshooting](#troubleshooting) for why
-  this matters — it is the single most important setting here.
-- No web UI. Bedrock has none; there is no `ts-serve.json` in this repo.
+If remote access is ever wanted the correct fix is a real TUN device on the host
+so Tailscale leaves userspace mode — **not** a published port and **not** a funnel.
 
 ## Run
 
-Fill `.env` if you have not already, then:
-
 ```bash
+cp .env.example .env     # already done on the homelab
 docker compose up -d
-docker compose logs -f bedrock
+docker compose logs -f minecraft
 ```
 
-Wait for `Server started.` then confirm it is listening on UDP 19132.
+First boot takes a few minutes: it downloads Paper, the plugins, then generates
+the world. Wait for `Done (...)! For help, type "help"`.
+
+Verify both paths:
+
+```bash
+# Bedrock path (expect a RakNet response, not zero bytes)
+printf '01000000000000000000ffff00fefefefefdfdfdfd123456780000000000000000' \
+  | xxd -r -p | timeout 5 nc -u 192.168.4.37 19132 | wc -c
+
+# Java path
+nc -z 192.168.4.37 25565 && echo "java port open"
+```
 
 ## Connecting
 
-The server address is **the homelab's LAN IP on port `19132`**:
+### From an iPad (Bedrock)
 
-```text
-192.168.4.37:19132
-```
+1. iPad on the home wifi.
+2. Minecraft → **Play** → **Servers** → scroll down → **Add Server**.
+3. Address `192.168.4.37`, port `19132`.
+4. Join. Floodgate means **no Java account is needed** — the existing Xbox Live
+   family accounts are enough.
 
-That is the current address of this host. If its DHCP lease ever changes you
-will need to update the server entry on each device — consider a DHCP
-reservation for the homelab.
+### From a Java client
 
-### From an iPad (primary use case)
-
-1. Make sure the iPad is on the home wifi.
-2. Open Minecraft → **Play** → **Servers** → scroll down → **Add Server**.
-3. Server Address: `192.168.4.37`, Port: `19132`.
-4. Save, then join.
-5. Each player signs in with their Xbox Live / Microsoft account (the family
-   accounts already set up for the kids).
-
-**No Tailscale is needed on the iPads.** They are on the same LAN, so ordinary
-local networking is enough.
-
-### From a Windows PC
-
-Identical steps: Windows uses the same Bedrock Edition and cross-plays with the
-iPads. Bedrock also auto-discovers LAN games, so the server may appear in the
-**Friends** tab without adding it manually.
+1. Add a server: `192.168.4.37:25565`.
+2. A 26.3 client connects fine — ViaVersion translates it to the server's 26.2.
+3. You will be asked to authenticate with your Mojang/Microsoft account
+   (`ONLINE_MODE=true`).
 
 ## Configuration
-
-All game settings are environment variables in `.env`.
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `EULA` | Accept the Mojang EULA (`TRUE` required) | `TRUE` |
+| `MINECRAFT_VERSION` | Server version — **leave at 26.2** | `26.2` |
 | `SERVER_NAME` | Name shown in the server list | `Copeland Family Minecraft` |
+| `MOTD` | Message shown under the name | see `.env.example` |
 | `GAMEMODE` | `survival`, `creative`, `adventure` | `survival` |
 | `DIFFICULTY` | `peaceful`, `easy`, `normal`, `hard` | `normal` |
-| `ALLOW_CHEATS` | Enable commands/cheats | `false` |
-| `ONLINE_MODE` | Require Xbox Live auth | `true` |
-| `TRANSPORT` | **Must stay `raknet`** — see Troubleshooting | `raknet` |
-| `ALLOW_LIST` | Strict per-player allowlist | `false` |
+| `ALLOW_CHEATS` | Enable command blocks | `false` |
+| `VIEW_DISTANCE` | Chunk view distance | `10` |
+| `MAX_PLAYERS` | Player cap | `10` |
+| `ONLINE_MODE` | Require authentication | `true` |
+| `MEMORY` | JVM heap for the server | `3G` |
+| `GEYSER_PORT` | Bedrock UDP port | `19132` |
 | `TZ` | Timezone | `America/New_York` |
 
-World data, configs and backups live in the named volume `minecraft_data`
-mounted at `/data`.
+World data lives in the named volume `minecraft-container_java_data` at `/data`.
 
 ## Troubleshooting
 
-### Clients cannot connect even though the server looks healthy
+### Container crash-loops with "Failed to download paper"
 
-**Check `transport` first.** Mojang changed the default transport to
-**NetherNet** in Bedrock 1.26.50+, and it is broken:
+Known issue: the itzg image's Paper installer still calls `api.papermc.io`,
+which PaperMC sunset (it now returns HTTP 410).
 
-> `transport=nethernet` renders server inaccessible … the server is **visible,
-> but not accessible**. Attempting to connect to the server times out with the
-> “door” error.
-> — [BDS-23108](https://mojira.dev/BDS-23108)
+This repo works around it by using `TYPE=CUSTOM` with a direct URL to the stable
+26.2 jar, instead of `TYPE=PAPER`. Switch back once the image tracks the new
+`fill.papermc.io` API.
 
-The symptom is nasty because the server looks fine: it logs
-`Accepting clients on [::]:19132` while **nothing is actually bound to 19132**.
-
-This repo forces `TRANSPORT=raknet`. Verify:
+To upgrade the server jar:
 
 ```bash
-docker exec minecraft-bedrock grep '^transport=' /data/server.properties
-# expect: transport=raknet
-
-# confirm the UDP socket really exists (0x4ABC == 19132)
-docker exec minecraft-bedrock grep -i 4abc /proc/net/udp
+docker compose stop
+docker run --rm -v minecraft-container_java_data:/data alpine rm -f /data/paper-*.jar
+# update CUSTOM_SERVER in compose.yaml to the new jar URL, then:
+docker compose up -d
 ```
 
-You may see a `TRANSPORT TYPE ERROR` warning saying NetherNet is "the only
-supported transport type". That warning is expected and safe to ignore —
-`raknet` still works and is what clients need.
+### "MODRINTH_LOADER must be set" or "No files are available for ... loader paper"
 
-### Server is up but not reachable from the LAN
+`TYPE=CUSTOM` gives the image no game version, so plugin lookups fail. Both
+`VERSION=26.2` and `MODRINTH_LOADER=paper` are required and already set.
+
+Separately: **Geyser and Floodgate are not installable from Modrinth.** The
+Modrinth `floodgate` project is *Floodgate-Modded*, a Fabric/NeoForge port with
+no Paper build. Both come from GeyserMC's own download service via `PLUGINS`.
+ViaVersion and ViaBackwards do publish a paper loader, so they use Modrinth.
+
+### A Bedrock client cannot join
+
+Check Geyser is listening and the plugin loaded:
 
 ```bash
-ss -lunp | grep 19132           # on the homelab
-docker compose logs bedrock | tail -20
+ss -lun | grep 19132
+docker compose logs minecraft | grep -i geyser | tail -20
 ```
 
-Also confirm the client is on the same network and that the LAN IP has not
-changed.
+Geyser supports Bedrock **26.30–26.52**. A significantly older Bedrock client
+will be refused; update the game on the device.
 
-### Players are locked out / "allow list" warnings
+### A Java client cannot join
 
-The Bedrock image defaults `allow-list=true` with an empty list, which blocks
-everyone. This repo sets `ALLOW_LIST=false` so a fresh volume cannot
-reintroduce it. Access control comes from `ONLINE_MODE` instead. To restrict to
-specific players, set `ALLOW_LIST=true` and add entries to
-`/data/allowlist.json` in the `minecraft_data` volume.
+`ONLINE_MODE=true` means a real Mojang/Microsoft login is required. Check the
+client is on 26.3 or older (ViaVersion handles newer clients joining an older
+server, not the reverse without ViaBackwards).
 
-### After a Minecraft update, clients suddenly cannot join
+### After a Minecraft update
 
-Bedrock auto-updates on the client but not the server. Restart to pull the new
-server build:
+Wait for Paper *and* Geyser to ship stable builds before raising
+`MINECRAFT_VERSION`. Raising it early puts you on beta server software and may
+break the Bedrock bridge.
+
+## Backups
+
+The world is in the `minecraft-container_java_data` volume:
 
 ```bash
-docker compose restart bedrock
+docker run --rm -v minecraft-container_java_data:/data -v "$PWD:/backup" \
+  alpine tar czf /backup/world-$(date +%F).tar.gz -C /data world
 ```
 
 ## Security notes
 
-- Online mode is on, so players authenticate against Xbox Live and cannot spoof
-  names or join anonymously.
-- There is **no allowlist** (deliberate). Anyone on the home LAN with a valid
-  Xbox Live account can join.
-- The server is reachable from the home LAN only. It is not exposed to the
-  internet, and it is not on the tailnet. Do **not** add port forwards or a
-  funnel.
-- No secrets are stored in this repo. `.env` is git-ignored.
+- Reachable from the **home LAN only**. Not exposed to the internet, and not on
+  the tailnet. Do **not** add port forwards or a funnel.
+- `ONLINE_MODE=true`: Java players authenticate normally; Bedrock players go
+  through Floodgate, which trusts Xbox Live identities.
+- No allowlist is configured, so anyone on the home wifi with a valid account
+  can join. Add one if that becomes a problem.
+- RCON listens on `25575` inside the container. It is bound on the host network,
+  so treat it as LAN-visible; change or disable `ENABLE_RCON` if that matters.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `compose.yaml` | Bedrock server on the host network |
-| `entrypoint.sh` | preserves the image's graceful-shutdown entrypoint |
-| `.env` / `.env.example` | game configuration (`.env` is git-ignored) |
+| `compose.yaml` | Paper + Geyser server on the host network |
+| `.env` / `.env.example` | server configuration (`.env` is git-ignored) |
