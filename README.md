@@ -1,170 +1,187 @@
 # Minecraft Bedrock on the homelab
 
-Self-hosted Minecraft Bedrock Dedicated Server — the edition that runs on
-**iPads and Windows PCs** (cross-play) — reachable **only over the tailnet**
-using the same tailscale-sidecar pattern as `~/Dev/kavita-container`,
-`~/Dev/storyteller-container`, `~/Dev/yamtrack-container`, `~/Dev/romm`, and
-`~/Dev/n8n`. No funnel, no published host ports — the server is available only
-to devices on the tailnet.
+A self-hosted [Minecraft Bedrock Dedicated Server](https://www.minecraft.net/en-us/download/server/bedrock)
+for **iPads and Windows PCs on the home LAN**, running on port `19132`.
 
-## Why Bedrock (and why no funnel)
+> **Tailnet-only was investigated and rejected.** See
+> [Why this runs on the host network](#why-this-runs-on-the-host-network) — the
+> short version is that Tailscale cannot carry a Bedrock server in this homelab's
+> current configuration, and the intended clients (the kids' iPads) are at home
+> anyway.
+
+## Why Bedrock
 
 Bedrock Edition is the edition that runs on **iPads and Windows PC**, and those
-two cross-play on the same server. Java Edition cannot be joined by an iPad, and
-Tailscale Funnel cannot carry a Minecraft server regardless of edition:
+two cross-play on the same server. Java Edition cannot be joined by an iPad.
 
-- Funnel only listens on ports `443`, `8443`, and `10000`, is TLS-only, and has
-  no UDP support at all.
-- Bedrock speaks RakNet over **UDP 19132**, so it is not Funnel-able.
+## Why this runs on the host network
 
-The tailnet-only pattern used by the rest of this homelab is therefore the right
-fit — and the safer choice for kids' devices.
+This stack deliberately does **not** use the tailscale-sidecar pattern that
+`kavita-container`, `romm`, `n8n-container` and the others use. Two independent
+problems make that pattern unusable here:
+
+**1. Tailscale cannot proxy UDP.** Every other stack in this homelab is an HTTP
+app, reached through `tailscale serve`, which is an HTTP/TCP reverse proxy. It
+has no UDP support (and `funnel` is TLS/SNI-based, so UDP is out there too).
+Bedrock is pure RakNet over UDP 19132, so there is no proxy path for it.
+
+**2. This homelab has no `/dev/net/tun`.** Without that device node Tailscale
+runs in `tun=userspace-networking` mode, where it forwards inbound tailnet
+traffic to `localhost` *within its own process tree*. A UDP socket owned by a
+different container is not reachable that way. Verified directly:
+
+```text
+sidecar listening on 19132, reached over tailnet   -> received
+app container listening on 19132, over tailnet     -> 0 bytes
+app container on 127.0.0.1:19132                   -> 148-byte RakNet pong
+```
+
+So the server runs on the **host network** instead. It binds the host's normal
+interfaces and any device on the home wifi reaches it directly. If remote access
+is ever wanted, the correct fix is a real TUN device on the host so Tailscale
+leaves userspace mode — **not** a published port and **not** a funnel.
 
 ## How it works
 
-- A **tailscale sidecar** joins the tailnet as host `minecraft`. It does **not**
-  run `tailscale serve` — this stack is pure UDP, and Tailscale carries RakNet
-  traffic natively inside the tailnet. No `AllowFunnel`, no HTTPS handlers.
-- **`bedrock`** shares the sidecar's namespace
-  (`network_mode: service:tailscale`). It is not published on the host, so
-  nothing on the LAN or internet can reach it.
-- A **`sidecar-entrypoint.sh`** wrapper on the tailscale sidecar pins the shared
-  network interface MTU to 1280 before `tailscaled` starts (see
-  [Troubleshooting iOS clients](#troubleshooting-ios-clients)). It lives on the
-  sidecar because that container owns the namespace and is the only image here
-  that ships an `ip` command.
-- An **`entrypoint.sh`** wrapper on the Bedrock container just preserves the
-  image's graceful-shutdown entrypoint.
+- `bedrock` runs with `network_mode: host`, so it binds the host's interfaces
+  directly on UDP `19132`.
+- `entrypoint.sh` preserves the image's graceful-shutdown entrypoint, so
+  `docker compose stop` saves the world cleanly rather than killing it.
+- `TRANSPORT=raknet` is forced. See [Troubleshooting](#troubleshooting) for why
+  this matters — it is the single most important setting here.
+- No web UI. Bedrock has none; there is no `ts-serve.json` in this repo.
 
 ## Run
 
-Fill `.env` (`TAILSCALE_AUTH_KEY`) if you haven't, then:
+Fill `.env` if you have not already, then:
 
 ```bash
 docker compose up -d
 docker compose logs -f bedrock
 ```
 
-Verify over the tailnet:
+Wait for `Server started.` then confirm it is listening on UDP 19132.
 
-```bash
-tailscale status | grep minecraft
+## Connecting
+
+The server address is **the homelab's LAN IP on port `19132`**:
+
+```text
+192.168.4.37:19132
 ```
 
-## First-time setup
+That is the current address of this host. If its DHCP lease ever changes you
+will need to update the server entry on each device — consider a DHCP
+reservation for the homelab.
 
-1. Bring the stack up (`docker compose up -d`).
-2. Watch the logs (`docker compose logs -f bedrock`) until you see the server
-   listening on UDP 19132.
-3. The server is now reachable at the tailnet IP of the `minecraft` node and
-   (for most clients) at `minecraft.<your-tailnet>.ts.net`.
+### From an iPad (primary use case)
 
-## Connecting from an iPad
+1. Make sure the iPad is on the home wifi.
+2. Open Minecraft → **Play** → **Servers** → scroll down → **Add Server**.
+3. Server Address: `192.168.4.37`, Port: `19132`.
+4. Save, then join.
+5. Each player signs in with their Xbox Live / Microsoft account (the family
+   accounts already set up for the kids).
 
-> **Use the tailnet IP, not the MagicDNS hostname.** Open iOS Tailscale has
-> unresolved MagicDNS bugs
-> ([tailscale/tailscale#18385](https://github.com/tailscale/tailscale/issues/18385),
-> [#13799](https://github.com/tailscale/tailscale/issues/13799)) where in-app
-> hostname resolution fails unless an exit node is configured. Use the server's
-> 100.x.y.z Tailscale IP directly.
+**No Tailscale is needed on the iPads.** They are on the same LAN, so ordinary
+local networking is enough.
 
-1. Open the Minecraft app.
-2. Tap **Play** → **Servers** → **Add Server**.
-3. Enter the server's 100.x.y.z tailnet IP and port **19132**.
-4. Tap **Save** and join.
-5. Players must sign in with their Xbox Live / Microsoft account (family accounts
-   already set up for the kids).
+### From a Windows PC
 
-## Connecting from a PC
-
-1. Open Minecraft Bedrock Edition (via Windows Store/Xbox app).
-2. Click **Play** → **Servers** → **Add Server**.
-3. Enter `minecraft.<your-tailnet>.ts.net` (MagicDNS) or the 100.x.y.z tailnet
-   IP, port **19132**.
-4. Click **Save** and join.
-5. Sign in with the same Xbox Live / Microsoft account used on the iPad.
+Identical steps: Windows uses the same Bedrock Edition and cross-plays with the
+iPads. Bedrock also auto-discovers LAN games, so the server may appear in the
+**Friends** tab without adding it manually.
 
 ## Configuration
 
-All game settings are controlled via environment variables in `.env`.
+All game settings are environment variables in `.env`.
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `TAILSCALE_AUTH_KEY` | Tailscale node auth key (required) | (none) |
 | `EULA` | Accept the Mojang EULA (`TRUE` required) | `TRUE` |
 | `SERVER_NAME` | Name shown in the server list | `Copeland Family Minecraft` |
-| `GAMEMODE` | Default game mode (`survival`, `creative`, `adventure`) | `survival` |
-| `DIFFICULTY` | World difficulty (`peaceful`, `easy`, `normal`, `hard`) | `normal` |
-| `ALLOW_CHEATS` | Enable commands/cheats (`true`/`false`) | `false` |
-| `ONLINE_MODE` | Require Xbox Live auth (`true`/`false`) | `true` |
-| `ALLOW_LIST` | Strict per-player allowlist (`true`/`false`) | `false` |
-| `MTU_INTERFACE` | Interface the iOS MTU fix is applied to | `eth0` |
-| `MTU_VALUE` | MTU value pinned for iOS clients | `1280` |
+| `GAMEMODE` | `survival`, `creative`, `adventure` | `survival` |
+| `DIFFICULTY` | `peaceful`, `easy`, `normal`, `hard` | `normal` |
+| `ALLOW_CHEATS` | Enable commands/cheats | `false` |
+| `ONLINE_MODE` | Require Xbox Live auth | `true` |
+| `TRANSPORT` | **Must stay `raknet`** — see Troubleshooting | `raknet` |
+| `ALLOW_LIST` | Strict per-player allowlist | `false` |
 | `TZ` | Timezone | `America/New_York` |
 
-World data, configs, and backups live in the named volume `minecraft_data`
+World data, configs and backups live in the named volume `minecraft_data`
 mounted at `/data`.
 
-## Troubleshooting iOS clients
+## Troubleshooting
 
-**"Locating server" hangs indefinitely**
+### Clients cannot connect even though the server looks healthy
 
-iOS Bedrock clients cannot communicate their effective MTU through the Tailscale
-app, so RakNet MTU discovery fails and the client hangs at "Locating server"
-while Windows clients connect fine. See
-[itzg/docker-minecraft-bedrock-server#553](https://github.com/itzg/docker-minecraft-bedrock-server/discussions/553).
+**Check `transport` first.** Mojang changed the default transport to
+**NetherNet** in Bedrock 1.26.50+, and it is broken:
 
-The `sidecar-entrypoint.sh` wrapper pins the shared interface MTU to 1280
-(`ip link set dev eth0 mtu 1280`) before `tailscaled` starts. It runs on the
-**tailscale sidecar**, not the Bedrock container, because the Bedrock image is a
-slim Debian that ships no networking tools at all — no `ip`, `ifconfig`, or
-even `busybox`. The sidecar owns the shared network namespace and has `ip`, so
-setting the MTU there applies to both containers.
+> `transport=nethernet` renders server inaccessible … the server is **visible,
+> but not accessible**. Attempting to connect to the server times out with the
+> “door” error.
+> — [BDS-23108](https://mojira.dev/BDS-23108)
 
-If the command fails, the script logs a warning and continues — the container
-will not crash, but iOS clients may still hang.
+The symptom is nasty because the server looks fine: it logs
+`Accepting clients on [::]:19132` while **nothing is actually bound to 19132**.
 
-**Verify it worked:**
+This repo forces `TRANSPORT=raknet`. Verify:
 
 ```bash
-docker compose logs tailscale | grep entrypoint
-# expect: [entrypoint] Set eth0 MTU to 1280 (iOS RakNet MTU discovery fix).
+docker exec minecraft-bedrock grep '^transport=' /data/server.properties
+# expect: transport=raknet
 
-docker exec minecraft-tailscale cat /sys/class/net/eth0/mtu   # expect 1280
-docker exec minecraft-bedrock    cat /sys/class/net/eth0/mtu   # expect 1280 (shared netns)
+# confirm the UDP socket really exists (0x4ABC == 19132)
+docker exec minecraft-bedrock grep -i 4abc /proc/net/udp
 ```
 
-If you see the warning instead of the confirmation, check that the sidecar has
-`cap_add: [net_admin, net_raw]` (it does in `compose.yaml`) and that the
-interface name matches — override it with `MTU_INTERFACE` / `MTU_VALUE` in
-`.env` if your host differs.
+You may see a `TRANSPORT TYPE ERROR` warning saying NetherNet is "the only
+supported transport type". That warning is expected and safe to ignore —
+`raknet` still works and is what clients need.
 
-**MagicDNS hostname does not resolve on iOS**
+### Server is up but not reachable from the LAN
 
-As noted in [Connecting from an iPad](#connecting-from-an-ipad), open iOS
-Tailscale has bugs that break MagicDNS resolution in the Minecraft app unless an
-exit node is active. Use the raw 100.x.y.z tailnet IP instead.
+```bash
+ss -lunp | grep 19132           # on the homelab
+docker compose logs bedrock | tail -20
+```
+
+Also confirm the client is on the same network and that the LAN IP has not
+changed.
+
+### Players are locked out / "allow list" warnings
+
+The Bedrock image defaults `allow-list=true` with an empty list, which blocks
+everyone. This repo sets `ALLOW_LIST=false` so a fresh volume cannot
+reintroduce it. Access control comes from `ONLINE_MODE` instead. To restrict to
+specific players, set `ALLOW_LIST=true` and add entries to
+`/data/allowlist.json` in the `minecraft_data` volume.
+
+### After a Minecraft update, clients suddenly cannot join
+
+Bedrock auto-updates on the client but not the server. Restart to pull the new
+server build:
+
+```bash
+docker compose restart bedrock
+```
 
 ## Security notes
 
-- The instance is intentionally **not** exposed to the LAN or internet; it's
-  safe behind the tailnet. Do **not** add published ports or funnel access.
-- The only secret is `TAILSCALE_AUTH_KEY` in `.env` (git-ignored). Rotate it in
-  the Tailscale admin console if it ever leaks.
-- `ONLINE_MODE=true` requires real Xbox Live accounts, so players can't spoof
+- Online mode is on, so players authenticate against Xbox Live and cannot spoof
   names or join anonymously.
-- The Bedrock server image defaults its allow list to **enabled with no
-  entries**, which locks everyone out. `ALLOW_LIST=false` is set explicitly in
-  `compose.yaml` to override that. Access control comes from `ONLINE_MODE`
-  instead — anyone on the tailnet with a valid Xbox Live account can join.
-  To restrict to specific players, set `ALLOW_LIST=true` and add entries to
-  `/data/allowlist.json` in the `minecraft_data` volume.
+- There is **no allowlist** (deliberate). Anyone on the home LAN with a valid
+  Xbox Live account can join.
+- The server is reachable from the home LAN only. It is not exposed to the
+  internet, and it is not on the tailnet. Do **not** add port forwards or a
+  funnel.
+- No secrets are stored in this repo. `.env` is git-ignored.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `compose.yaml` | tailscale sidecar + Bedrock server |
-| `sidecar-entrypoint.sh` | sidecar wrapper: iOS MTU fix, then starts tailscaled |
-| `entrypoint.sh` | Bedrock wrapper: preserves the image's graceful shutdown |
-| `.env` / `.env.example` | secrets/config (`.env` is git-ignored) |
+| `compose.yaml` | Bedrock server on the host network |
+| `entrypoint.sh` | preserves the image's graceful-shutdown entrypoint |
+| `.env` / `.env.example` | game configuration (`.env` is git-ignored) |

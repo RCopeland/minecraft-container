@@ -1,43 +1,32 @@
 services:
-  # --- The Bodyguard (Tailscale) ---
-  # Joins the tailnet as "minecraft". No tailscale serve config is provided
-  # because this stack is pure UDP — Bedrock speaks RakNet over UDP 19132,
-  # which Tailscale carries natively inside the tailnet. HTTPS certificates
-  # and funnel are irrelevant here, so TS_SERVE_CONFIG and TS_CERT_DOMAIN are
-  # intentionally omitted.
-  #
-  # This sidecar also applies the iOS MTU fix (see sidecar-entrypoint.sh): it
-  # owns the shared netns and is the only image in this stack that ships `ip`.
-  tailscale:
-    image: tailscale/tailscale:latest
-    container_name: minecraft-tailscale
-    hostname: minecraft
-    entrypoint: ["/bin/sh", "/sidecar-entrypoint.sh"]
-    environment:
-      - TS_AUTHKEY=${TAILSCALE_AUTH_KEY}
-      - TS_STATE_DIR=/var/lib/tailscale
-      # iOS RakNet MTU discovery fix (see sidecar-entrypoint.sh).
-      - MTU_INTERFACE=${MTU_INTERFACE:-eth0}
-      - MTU_VALUE=${MTU_VALUE:-1280}
-    volumes:
-      - tailscale_data:/var/lib/tailscale
-      - ./sidecar-entrypoint.sh:/sidecar-entrypoint.sh:ro
-    cap_add:
-      - net_admin
-      - net_raw
-    restart: unless-stopped
-
   # --- The App (Bedrock) ---
-  # Shares the tailscale container's network namespace, so it is ONLY reachable
-  # over the tailnet (via the 100.x.y.z tailnet IP or the MagicDNS hostname).
-  # No host ports are published, so nothing is exposed on the LAN or internet.
+  #
+  # Runs on the HOST network, not behind the tailscale sidecar. This is
+  # deliberate and load-bearing:
+  #
+  #   * Bedrock speaks RakNet over UDP 19132. Tailscale's `serve` is TCP/HTTP
+  #     only, so there is no proxy path for it.
+  #   * This homelab has no /dev/net/tun, so every container runs
+  #     tun=userspace-networking. That mode forwards inbound tailnet traffic to
+  #     localhost *within the sidecar's own process tree*. A UDP socket owned by
+  #     a different container is not reachable that way -- verified by test:
+  #     the sidecar could receive tailnet UDP on any port, the app container
+  #     never could.
+  #
+  # On the host network the server binds the host's regular interfaces, so any
+  # device on the home LAN reaches it directly at <host-lan-ip>:19132. That is
+  # the intended access path: the kids' iPads are on the home wifi and do not
+  # need Tailscale at all.
+  #
+  # If remote access is ever wanted, the correct fix is a real TUN device
+  # (/dev/net/tun) on the host so Tailscale leaves userspace mode -- not a
+  # published port and not a funnel.
   bedrock:
     image: itzg/minecraft-bedrock-server:latest
     container_name: minecraft-bedrock
-    network_mode: service:tailscale
+    network_mode: host
     restart: unless-stopped
-    # Keep graceful-shutdown defaults (see entrypoint.sh). The iOS MTU fix is
-    # applied by the tailscale sidecar, which owns this container's netns.
+    # Keep graceful-shutdown defaults (see entrypoint.sh).
     entrypoint: ["/bin/sh", "/entrypoint.sh"]
     environment:
       - EULA=${EULA}
@@ -46,18 +35,19 @@ services:
       - DIFFICULTY=${DIFFICULTY}
       - ALLOW_CHEATS=${ALLOW_CHEATS}
       - ONLINE_MODE=${ONLINE_MODE}
+      # MUST stay raknet. Bedrock 1.26.50+ defaults to transport=nethernet,
+      # which is a known Mojang regression (BDS-23108): the server logs
+      # "Accepting clients on 19132" but never opens the UDP socket, and every
+      # client times out. Set explicitly so a fresh /data volume cannot
+      # reintroduce the broken default.
+      - TRANSPORT=${TRANSPORT:-raknet}
       # The Bedrock image defaults allow-list=true with an empty list, which
-      # locks everyone out. No allowlist is wanted here (Xbox Live auth via
-      # ONLINE_MODE is the access control), so it is disabled explicitly to
-      # survive a fresh /data volume.
+      # locks everyone out. Access control comes from ONLINE_MODE instead.
       - ALLOW_LIST=${ALLOW_LIST:-false}
       - TZ=${TZ:-America/New_York}
     volumes:
       - minecraft_data:/data
       - ./entrypoint.sh:/entrypoint.sh:ro
-    depends_on:
-      - tailscale
 
 volumes:
-  tailscale_data:
   minecraft_data:
