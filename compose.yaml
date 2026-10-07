@@ -15,8 +15,8 @@ services:
     volumes:
       - tailscale_data:/var/lib/tailscale
     cap_add:
-      - NET_ADMIN
-      - NET_RAW
+      - net_admin
+      - net_raw
     restart: unless-stopped
 
   # --- The App (Bedrock) ---
@@ -29,7 +29,7 @@ services:
     network_mode: service:tailscale
     restart: unless-stopped
     cap_add:
-      - NET_ADMIN
+      - net_admin
     # Override the image entrypoint so we can apply the iOS MTU fix before
     # starting the server.
     entrypoint: ["/bin/sh", "/entrypoint.sh"]
