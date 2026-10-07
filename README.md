@@ -28,9 +28,13 @@ fit — and the safer choice for kids' devices.
 - **`bedrock`** shares the sidecar's namespace
   (`network_mode: service:tailscale`). It is not published on the host, so
   nothing on the LAN or internet can reach it.
-- An **`entrypoint.sh`** wrapper runs before the server to apply an iOS MTU fix
-  (see [Troubleshooting iOS clients](#troubleshooting-ios-clients)). The script
-  pins the default route MTU to 1280; if it can't, it warns and continues.
+- A **`sidecar-entrypoint.sh`** wrapper on the tailscale sidecar pins the shared
+  network interface MTU to 1280 before `tailscaled` starts (see
+  [Troubleshooting iOS clients](#troubleshooting-ios-clients)). It lives on the
+  sidecar because that container owns the namespace and is the only image here
+  that ships an `ip` command.
+- An **`entrypoint.sh`** wrapper on the Bedrock container just preserves the
+  image's graceful-shutdown entrypoint.
 
 ## Run
 
@@ -93,6 +97,9 @@ All game settings are controlled via environment variables in `.env`.
 | `DIFFICULTY` | World difficulty (`peaceful`, `easy`, `normal`, `hard`) | `normal` |
 | `ALLOW_CHEATS` | Enable commands/cheats (`true`/`false`) | `false` |
 | `ONLINE_MODE` | Require Xbox Live auth (`true`/`false`) | `true` |
+| `ALLOW_LIST` | Strict per-player allowlist (`true`/`false`) | `false` |
+| `MTU_INTERFACE` | Interface the iOS MTU fix is applied to | `eth0` |
+| `MTU_VALUE` | MTU value pinned for iOS clients | `1280` |
 | `TZ` | Timezone | `America/New_York` |
 
 World data, configs, and backups live in the named volume `minecraft_data`
@@ -107,13 +114,30 @@ app, so RakNet MTU discovery fails and the client hangs at "Locating server"
 while Windows clients connect fine. See
 [itzg/docker-minecraft-bedrock-server#553](https://github.com/itzg/docker-minecraft-bedrock-server/discussions/553).
 
-The `entrypoint.sh` wrapper attempts to pin the route MTU to 1280 before
-starting the server. If the container lacks `NET_ADMIN` (it is granted in
-`compose.yaml`) or the route command otherwise fails, the script logs a warning
-and continues — the container will not crash, but iOS clients may still hang.
+The `sidecar-entrypoint.sh` wrapper pins the shared interface MTU to 1280
+(`ip link set dev eth0 mtu 1280`) before `tailscaled` starts. It runs on the
+**tailscale sidecar**, not the Bedrock container, because the Bedrock image is a
+slim Debian that ships no networking tools at all — no `ip`, `ifconfig`, or
+even `busybox`. The sidecar owns the shared network namespace and has `ip`, so
+setting the MTU there applies to both containers.
 
-**Fix:** Verify the container has `cap_add: [NET_ADMIN]` and the route command
-succeeded in the logs.
+If the command fails, the script logs a warning and continues — the container
+will not crash, but iOS clients may still hang.
+
+**Verify it worked:**
+
+```bash
+docker compose logs tailscale | grep entrypoint
+# expect: [entrypoint] Set eth0 MTU to 1280 (iOS RakNet MTU discovery fix).
+
+docker exec minecraft-tailscale cat /sys/class/net/eth0/mtu   # expect 1280
+docker exec minecraft-bedrock    cat /sys/class/net/eth0/mtu   # expect 1280 (shared netns)
+```
+
+If you see the warning instead of the confirmation, check that the sidecar has
+`cap_add: [net_admin, net_raw]` (it does in `compose.yaml`) and that the
+interface name matches — override it with `MTU_INTERFACE` / `MTU_VALUE` in
+`.env` if your host differs.
 
 **MagicDNS hostname does not resolve on iOS**
 
@@ -129,13 +153,18 @@ exit node is active. Use the raw 100.x.y.z tailnet IP instead.
   the Tailscale admin console if it ever leaks.
 - `ONLINE_MODE=true` requires real Xbox Live accounts, so players can't spoof
   names or join anonymously.
-- No whitelist is configured (declined by user) — anyone on the tailnet with a
-  valid Xbox Live account can join.
+- The Bedrock server image defaults its allow list to **enabled with no
+  entries**, which locks everyone out. `ALLOW_LIST=false` is set explicitly in
+  `compose.yaml` to override that. Access control comes from `ONLINE_MODE`
+  instead — anyone on the tailnet with a valid Xbox Live account can join.
+  To restrict to specific players, set `ALLOW_LIST=true` and add entries to
+  `/data/allowlist.json` in the `minecraft_data` volume.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
 | `compose.yaml` | tailscale sidecar + Bedrock server |
-| `entrypoint.sh` | MTU fix for iOS clients, then starts the server |
+| `sidecar-entrypoint.sh` | sidecar wrapper: iOS MTU fix, then starts tailscaled |
+| `entrypoint.sh` | Bedrock wrapper: preserves the image's graceful shutdown |
 | `.env` / `.env.example` | secrets/config (`.env` is git-ignored) |
